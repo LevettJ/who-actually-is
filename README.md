@@ -38,8 +38,6 @@ This tool returns information about the owners and users of Internet resources, 
 <!-- GETTING STARTED -->
 ## Getting started
 
-> WHOactuallyIS does not currently support Windows because of a dependency on the `dns-crawler` Python package.
-
 **Install Python prerequisites**
 ```sh
 $ pip install -r requirements.txt
