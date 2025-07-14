@@ -20,7 +20,7 @@ from tld import get_fld, get_tld
 from whoactuallyis.dns import get_dns_lookup
 from whoactuallyis.matcher import match_entities, determine_best_primary_name
 from whoactuallyis.peeringdb import get_pdb_asn_lookup, get_pdb_org_lookup
-from whoactuallyis.rdap import get_asn_lookup
+from whoactuallyis.rdap import get_asn_lookup, get_announced_prefixes
 # from whoactuallyis.rdap import get_reverseripedb_lookup
 
 logger = logging.getLogger(__name__)
@@ -95,6 +95,7 @@ class WaiResponse:
         self.target: Optional[str] = target_input # The original input target
         self.final_target: Optional[Union[IPv4Address, IPv6Address, str, int]] = None # Processed target
         self.target_type: Optional[str] = None # 'ip', 'asn', 'domain'
+        self.recursive: bool = False
 
         self.raw: Dict[str, Any] = {
             'forward_dns': None,  # List (for IP->FQDNs) or dict (for Domain->Host->IPs)
@@ -152,17 +153,19 @@ def _determine_target_type(target: str) \
     return None, target
 
 
-def lookup(target: str) -> WaiResponse:
+def lookup(target: str, recursive: bool = False) -> WaiResponse:
     """
     Performs a WHOactuallyIS lookup on a target IP, ASN, or domain.
 
     Args:
         target: The string representation of the IP address, ASN, or domain.
+        recursive: (Optional) Performs ASN/prefix lookup recursively. This takes a lot of time.
 
     Returns:
         A WaiResponse object containing the lookup results.
     """
     r = WaiResponse(target_input=target)
+    r.recursive = recursive
     raw_users_data: List[Dict[str, Any]] = [] # Data from _lookup_* functions
 
     try:
@@ -178,7 +181,7 @@ def lookup(target: str) -> WaiResponse:
 
         if target_type == 'asn' and isinstance(processed_target, int):
             r.target_type = 'asn'
-            raw_users_data = _lookup_asn(str(processed_target))
+            raw_users_data = _lookup_asn(str(processed_target), r)
         elif target_type in ('ipv4', 'ipv6') and processed_target is not None:
             r.target_type = 'ip'
             raw_users_data = _lookup_ip(str(processed_target), r)
@@ -242,7 +245,7 @@ def lookup(target: str) -> WaiResponse:
     return r
 
 
-def _lookup_asn(target_asn_str: str) -> List[Dict[str, Any]]:
+def _lookup_asn(target_asn_str: str, r: WaiResponse) -> List[Dict[str, Any]]:
     """
     Performs a lookup for a target ASN.
 
@@ -252,17 +255,30 @@ def _lookup_asn(target_asn_str: str) -> List[Dict[str, Any]]:
     Returns:
         A list of dictionaries.
     """
+    r.raw['asns'] += target_asn_str
     collected_raw_users: List[Dict[str, Any]] = []
     processed_pdb_org_ids: Set[int] = set() # To avoid duplicate PeeringDB org processing
 
     # 1. RDAP ASN Lookup
     rdap_asn_data = _get_rdap_data(
-        f"AS{target_asn_str}", 'advertising_asn', whoisit.asn, target_asn_str
+        'AS'+target_asn_str, 'advertising_asn', whoisit.asn, 'AS'+target_asn_str
     )
     if rdap_asn_data:
         collected_raw_users.append(rdap_asn_data)
 
-    # 2. PeeringDB ASN and Organisation Lookup
+    # 2. RIPE RIS Prefixes Lookup
+    # Run only where ASN is the primary target, or when recursion is enabled
+    if str(r.final_target) == target_asn_str or r.recursive:
+        prefixes = get_announced_prefixes(target_asn_str)
+
+        for prefix in prefixes:
+            # Lookup information about containing prefixes
+            # Noting that these are of lower confidence as prefixes may not belong to ASN owner
+            # Primitive lookup: First IP in prefix range (inc. 0.0)
+            target_ip = prefix.get('prefix')[:-3] # Ignore prefix notation
+            collected_raw_users.extend(_lookup_ip(target_ip, r))
+
+    # 3. PeeringDB ASN and Organisation Lookup
     try:
         pdb_asn_results = get_pdb_asn_lookup(target_asn_str)
         for pdb_asn_entry in pdb_asn_results:
@@ -282,24 +298,70 @@ def _lookup_asn(target_asn_str: str) -> List[Dict[str, Any]]:
                         ]
                         full_address = ' '.join(part for part in address_parts if part and part.strip()).strip()
 
-                        peeringdb_org_data = {
-                            'type': 'peeringdb_org',
-                            # Resource for PeeringDB org can be the list of ASNs it owns
-                            'resource': [f"AS{asn.get('asn')}" for asn in pdb_org_detail.get('net_set', [])],
-                            'org_id': org_id,
-                            'name': pdb_org_detail.get('name'),
-                            'aka': pdb_org_detail.get('aka', ''),
-                            'address': full_address if full_address else None,
-                            'source': 'peering_db',
-                            'entities': None
-                        }
-                        collected_raw_users.append(peeringdb_org_data)
+                        for asn in pdb_org_detail.get('net_set', []):
+                            peeringdb_org_data = {
+                                'type': 'peeringdb_org',
+                                # Resource for PeeringDB org can be the list of ASNs it owns
+                                'resource': f"AS{asn.get('asn')}",
+                                'org_id': org_id,
+                                'name': pdb_org_detail.get('name'),
+                                'aka': pdb_org_detail.get('aka', ''),
+                                'address': full_address if full_address else None,
+                                'source': 'peering_db',
+                                'entities': None
+                            }
+                            collected_raw_users.append(peeringdb_org_data)
+
                         processed_pdb_org_ids.add(org_id)
                 except Exception as e_pdb_org:
                     logger.error("Error looking up PeeringDB org ID %s for ASN %s: %s",
                                  org_id, target_asn_str, e_pdb_org)
     except Exception as e_pdb_asn:
         logger.error("Error looking up PeeringDB ASN %s: %s", target_asn_str, e_pdb_asn)
+
+    collected_resources: Set[str] = set()
+    for item_data in collected_raw_users:
+        if item_data is None: # Skip if a lookup step returned None
+            continue
+
+        # Ensure 'entities' key exists; it can be None if lookup found no entities.
+        item_entities = item_data.get('entities')
+        item_resource = item_data.get('resource')
+
+        if item_resource:
+            collected_resources.add(str(item_resource))
+
+        if item_entities is not None: # Process if entities were found
+            processed_entity_list = _process_entities(
+                raw_rdap_entities=item_entities,
+                entity_source_type=item_data.get('type', 'unknown_type'),
+                entity_source_resource=str(item_resource) if item_resource else 'unknown_resource'
+            )
+            r.users.extend(processed_entity_list)
+        elif item_data.get('type') == 'peeringdb_org': # Handle PeeringDB entries
+            # PeeringDB entries are structured differently with 'name', 'address', 'source'.
+            adapted_pdb_entry = {
+                'type': item_data.get('type'),
+                'resource': str(item_resource) if item_resource else 'unknown_resource',
+                'relation': 'organisation',
+                'handle': None,
+                'name': item_data.get('name'),
+                'address': item_data.get('address'),
+                'tel': None,
+                'email': None,
+                'aka': {item_data.get('aka')} if item_data.get('aka', '') != '' else set(),
+                'source': item_data.get('source')
+            }
+            r.users.append(adapted_pdb_entry)
+
+    try:
+        match_entities(r)
+    except Exception as e:
+        msg = f"Error during entity matching for target '{target_asn_str}': {e}"
+        r.errors.append(msg)
+        logger.error(msg, exc_info=True)
+
+    r.resources = sorted(list(collected_resources))
 
     return collected_raw_users
 
@@ -376,22 +438,28 @@ def _lookup_ip(target_ip_str: str, r: WaiResponse) -> List[Dict[str, Any]]:
             logger.warning("Could not process FLD for parent zone entry '%s': %s", parent_fld, e_fld_parent)
 
     # 6. Get Advertising ASN for the target IP
+    new_asns = []
     try:
         asn_lookup_result = get_asn_lookup(target_ip_str)
-        r.raw['asns'] = list(set(asn_lookup_result.get('asns', []))) # Ensure unique ASNs
+        asn_lookup_result = asn_lookup_result.get('asns', [])
+
+        for asn in asn_lookup_result: # Prevent recursive ASN lookups
+            if asn not in r.raw['asns'] and asn not in new_asns:
+                new_asns.append(asn)
+
+        r.raw['asns'].extend(new_asns)
+
     except Exception as e:
         logger.error("Error during BGP ASN lookup for IP %s: %s", target_ip_str, e)
         r.errors.append(f"BGP ASN lookup failed for {target_ip_str}: {e}")
-        r.raw.setdefault('asns', [])
 
     # 7. For each ASN found, perform _lookup_asn
-    current_asns = r.raw.get('asns', [])
     all_asn_related_users: List[Dict[str, Any]] = []
-    for asn_val in current_asns:
+    for asn_val in new_asns:
         asn_num_str = str(asn_val).upper().replace('AS', '')
         if asn_num_str.isdigit():
             try:
-                asn_specific_users = _lookup_asn(asn_num_str)
+                asn_specific_users = _lookup_asn(asn_num_str, r)
                 all_asn_related_users.extend(asn_specific_users)
             except Exception as e_asn_detail:
                 logger.error("Error in _lookup_asn for ASN %s (from IP %s): %s",
@@ -542,12 +610,17 @@ def _lookup_domain(target_domain_str: str, r: WaiResponse) -> List[Dict[str, Any
                            parent_fld, e_fld_parent_rdap)
 
     # 6. For each unique ASN found from IPs, perform _lookup_asn
-    r.raw['asns'] = sorted(list(collected_asns_from_ips)) # Store unique ASN numbers
+    new_asns = []
+    for asn in list(collected_asns_from_ips): # Prevent recursive ASN lookups
+            if asn not in r.raw['asns'] and asn not in new_asns:
+                new_asns.append(asn)
+
+    r.raw['asns'].extend(new_asns)
     all_asn_related_users: List[Dict[str, Any]] = []
-    for asn_num_str in r.raw['asns']:
+    for asn_num_str in new_asns:
         if asn_num_str.isdigit():
             try:
-                asn_specific_users = _lookup_asn(asn_num_str)
+                asn_specific_users = _lookup_asn(asn_num_str, r)
                 all_asn_related_users.extend(asn_specific_users)
             except Exception as e_asn_detail:
                  logger.error("Error in _lookup_asn for ASN %s (from domain %s): %s",
@@ -651,6 +724,45 @@ def _process_entities(
     return processed_entities_list
 
 
+def get_final_names(r: WaiResponse) -> Dict[Any, str]:
+    """
+    Returns the final determined name(s) for resources.
+    """
+    logger.info("Attempting to resolve final names for target: %s", r.target)
+
+    if not r.users:
+        print(f"No user information found for target: {r.target}")
+        return {}
+
+    resolutions = {}
+    
+    for resource_id in r.resources:
+        relevant_users = [u for u in r.users if u.get('resource') == resource_id or resource_id in u.get('resource', [])]
+
+        names_final: str = ""
+        names_final_akas: Set[str] = set()
+        
+        for user in relevant_users:
+
+            # 'abuse' contacts are not considered primary owners.
+            # This can reveal information about resource leasing.
+            if user.get('relation') == 'abuse':
+                continue
+
+            user_akas = set(user.get('aka', [])).union(names_final_akas)
+
+            if names_final:
+                user_akas.add(user.get('name'))
+            else:
+                names_final = user.get('name','')
+
+            names_final, names_final_akas = determine_best_primary_name(names_final, list(user_akas))
+            
+        resolutions[resource_id] = names_final, names_final_akas
+    
+    return resolutions
+
+
 def show_final_name(r: WaiResponse) -> None:
     """
     Prints the final determined name(s) for resources.
@@ -662,43 +774,36 @@ def show_final_name(r: WaiResponse) -> None:
         return
 
     for resource_id in r.resources:
-        # Find users related to this specific resource
-        # This simple check might not be sufficient if relations are complex
         relevant_users = [u for u in r.users if u.get('resource') == resource_id or resource_id in u.get('resource', [])]
 
-        # Heuristic: try to find the most "definitive" name.
-        # This could be improved by `match_entities` adding a confidence score or primary flag.
-        names_to_print: List[str] = []
+        names_to_print: str = ""
+        names_final: str = ""
+        names_final_akas: Set[str] = set()
+        
         for user in relevant_users:
-            # Original filter: if user['relation'] in ['abuse']: continue
-            # This implies 'abuse' contacts are not considered primary owners.
+
+            # 'abuse' contacts are not considered primary owners.
+            # This can reveal information about resource leasing.
             if user.get('relation') == 'abuse':
                 continue
+
+            user_akas = set(user.get('aka', [])).union(names_final_akas)
+
+            if names_final:
+                user_akas.add(user.get('name'))
+            else:
+                names_final = user.get('name','')
+
+            names_final, names_final_akas = determine_best_primary_name(names_final, list(user_akas))
             
-            # Original RIPE specific commented out:
-            # if user['handle'] != None:
-            # if 'domain' not in user['type'] and 'org' not in user['handle'].lower():
-            # continue
-
-            user_name = user.get('name')
-            user_akas = user.get('aka') # Expected to be a set
-
-            user_name, user_akas = determine_best_primary_name(user.get('name'), user.get('aka', []))
-
-            display_name = ""
-            if user_name:
-                display_name = str(user_name)
-            
-            if user_akas: # Check if the set is not empty
-                # Convert set to sorted list for consistent display
-                akas_str = ", ".join(sorted(list(str(a) for a in user_akas)))
-                display_name += f" (AKA: {akas_str})" if display_name else f"AKA: {akas_str}"
-
-            if display_name and display_name not in names_to_print:
-                names_to_print.append(display_name)
+        if names_final:
+            names_to_print = names_final
+        if names_final_akas: # Check if the set is not empty
+            # Convert set to sorted list for consistent display
+            akas_str = ", ".join(sorted(list(str(a) for a in names_final_akas)))
+            names_to_print += f" (AKA: {akas_str})" if names_final else f"AKA: {akas_str}"
 
         if names_to_print:
-            names_to_print = sorted(names_to_print, key=len, reverse=True)[0]
             print(f"Resource: {resource_id} -> Name(s): {names_to_print}") # {'; '.join(names_to_print)}
         else:
             print(f"Resource: {resource_id} -> No primary name identified.")
