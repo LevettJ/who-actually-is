@@ -32,6 +32,11 @@ GENERIC_TERMS_PENALTY: Set[str] = {
     "GROUP", "HOLDING", "CONSULTING", "AGENCY", "TRADING", "INTERNATIONAL"
 }
 
+# Some terms in the name indicate the name is inaccurate
+UNLIKELY_NAME_PENALTY: Set[str] = {
+    "ABUSE", "ROLE", "OBJECT", "PRIVATE BY DESIGN"
+}
+
 SCORE_HAS_LEGAL_SUFFIX: int = 50
 SCORE_IS_ORIGINAL_NAME: int = 20 # Bonus if the name was the initial 'name'
 SCORE_TITLE_CASE: int = 10
@@ -42,6 +47,7 @@ SCORE_SYMBOLS_PENALTY: int = -10
 SCORE_VERY_SHORT_PENALTY: int = -30 # Penalty for names like "A" or "Co" if not suffix
 SCORE_GENERIC_TERM_PENALTY_VALUE: int = -25
 SCORE_PER_CHAR_LENGTH: float = 0.5 # Small bonus per character
+SCORE_UNLIKELY_NAME_PENALTY: int = -30
 
 def name_matcher(name1: Optional[str], name2: Optional[str]) -> bool:
     """
@@ -285,7 +291,7 @@ def score_name(name: str, is_original_name: bool) -> float:
     elif name.isupper():
         if 2 <= name_len <= 5: # Acronyms
             score += SCORE_ALL_CAPS_ACRONYM
-        elif name_len > 5 : # Longer all-caps names are less preferable
+        elif name_len > 8 : # Longer all-caps names are less preferable
             score += SCORE_ALL_CAPS_LONG_PENALTY
     
     if name.islower(): # Company name is unlikely to be fully lowercase
@@ -308,7 +314,12 @@ def score_name(name: str, is_original_name: bool) -> float:
         if len(non_suffix_parts) < 3:
              score += SCORE_GENERIC_TERM_PENALTY_VALUE / 2
 
-    # 7. Penalty for use of hypens
+    # 7. Penalty for unlikely terms in the name
+    unlikely_parts_found = name_parts.intersection(UNLIKELY_NAME_PENALTY)
+    if non_suffix_parts and len(unlikely_parts_found) >= 1:
+        score += SCORE_UNLIKELY_NAME_PENALTY * len(unlikely_parts_found)
+
+    # 8. Penalty for use of hypens
     for symbol in ['-', '#']:
         score += name.count(symbol) * SCORE_SYMBOLS_PENALTY
 
