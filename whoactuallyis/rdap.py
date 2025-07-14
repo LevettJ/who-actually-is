@@ -45,3 +45,27 @@ def get_reverseripedb_lookup(org):
             asns.append(result['primary-key']['attribute'][0]['value'])
 
     return asns
+
+def get_announced_prefixes(resource):
+    """
+    Get the prefixes announced by an ASN as seen by RIPE RIS.
+
+    Returns:
+        JSON response from the RIPEstat Announced Prefixes API.
+    """
+    HEADERS = {'content-type': 'application/json'}
+    # Default lookup: last two weeks (to current date/time)
+    # Default minumum peers to be listed: 10
+    # Keeping default lookup values
+    PARAMS = {'resource': resource}
+    url = 'https://stat.ripe.net/data/announced-prefixes/data.json'
+
+    # Get Data
+    prefixes = requests.get(url, headers=HEADERS, params=PARAMS, timeout=10).content
+    prefixes = ujson.loads(prefixes)
+
+    prefixes = prefixes.get('data', [])
+    if prefixes:
+        prefixes = prefixes.get('prefixes')
+
+    return prefixes
